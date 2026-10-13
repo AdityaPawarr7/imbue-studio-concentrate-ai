@@ -1,0 +1,1546 @@
+diff --git a/system/apps/chat/frontend/src/views/ModelProviderMenu.test.ts b/system/apps/chat/frontend/src/views/ModelProviderMenu.test.ts
+index 029c83267..dc6d507fb 100644
+--- a/system/apps/chat/frontend/src/views/ModelProviderMenu.test.ts
++++ b/system/apps/chat/frontend/src/views/ModelProviderMenu.test.ts
+@@ -1184,3 +1184,62 @@ describe("the phone layout's card", () => {
+     expect(document.querySelector('[data-menu-row="source-view"]')).toBeNull();
+   });
+ });
++
++describe("a claude account on a gateway", () => {
++  /** A model option as the backend sends one, offered in the picker. */
++  function optionOf(id: string, label: string): Record<string, unknown> {
++    return { ...OPUS, id, label };
++  }
++
++  /** Answer the chat's model-options ask with ``response``, and let the answer land. */
++  async function openModelListAnswering(response: unknown): Promise<void> {
++    const request = vi.spyOn(m, "request").mockResolvedValue(response as never);
++    render();
++    click(".model-selector-trigger");
++    click('[data-menu-row="model"]');
++    await vi.waitFor(() => expect(request).toHaveBeenCalled());
++    await Promise.resolve();
++    render();
++    const urls = request.mock.calls.map(([options]) => (options as unknown as { url: string }).url);
++    expect(urls.some((url) => url.includes("model-options"))).toBe(true);
++  }
++
++  function modelRows(): HTMLElement[] {
++    return [...document.querySelectorAll<HTMLElement>('[data-menu-part="submenu"] button')].filter(
++      (row) => row.getAttribute("data-menu-row") === null && row.querySelector('[aria-hidden="true"]') !== null,
++    );
++  }
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++  });
++
++  it("lists every model the gateway offers, past the search picker's cap, each beside its vendor's mark", async () => {
++    // Concentrate's list runs to some 160 models once the Claude aliases are folded in; a list
++    // picker cut off at the search picker's cap would hide the last 60 with nothing to scroll to.
++    const extra = Array.from({ length: 150 }, (_, i) => optionOf(`kimi-k${i}`, `Kimi K${i}`));
++    await openModelListAnswering({ models: null, options: [OPUS, optionOf("gpt-5", "GPT-5"), ...extra] });
++    const rows = modelRows();
++    expect(rows).toHaveLength(152);
++    const last = rows[rows.length - 1];
++    expect(last.textContent).toContain("Kimi K149");
++    expect(last.querySelector("svg")).not.toBeNull();
++    const gpt = rows.find((row) => row.textContent?.includes("GPT-5"));
++    expect(gpt?.querySelector("svg")).not.toBeNull();
++  });
++
++  it("keeps the catalog's list for an account that answers with no list of its own", async () => {
++    await openModelListAnswering({ models: null, options: null });
++    const rows = modelRows();
++    expect(rows.map((row) => row.textContent?.trim())).toEqual(["Opus"]);
++  });
++
++  it("gives a model no vendor knows a blank mark that holds the label's place", async () => {
++    await openModelListAnswering({ models: null, options: [optionOf("apodex-1.1-mini", "Apodex 1.1 Mini")] });
++    const [row] = modelRows();
++    expect(row.textContent).toContain("Apodex 1.1 Mini");
++    const mark = row.querySelector<HTMLElement>('[aria-hidden="true"]');
++    expect(mark?.className).toBe(css.SUBMENU_ROW_MARK);
++    expect(mark?.querySelector("svg")).toBeNull();
++  });
++});
+diff --git a/system/apps/chat/frontend/src/views/ModelProviderMenu.ts b/system/apps/chat/frontend/src/views/ModelProviderMenu.ts
+index 74b36d41f..04a8ed0f7 100644
+--- a/system/apps/chat/frontend/src/views/ModelProviderMenu.ts
++++ b/system/apps/chat/frontend/src/views/ModelProviderMenu.ts
+@@ -85,6 +85,7 @@ import {
+ import { slidersGlyph } from "../glyphs";
+ import { accountRow, emptyAccountRowState } from "./accountRow";
+ import { capitalizeEffort, modelPickLabel } from "./model-pick-label";
++import { modelMark } from "./providerMarks";
+ import * as css from "./modelProviderMenuStyles";
+ import { createSlidingMenuTrack } from "./slidingMenuTrack";
+ 
+@@ -761,7 +762,9 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+       .filter((option) => offeredIds === null || offeredIds.has(option.id));
+     const query = modelQuery.trim().toLowerCase();
+     const filtered = query === "" ? all : all.filter((option) => option.label.toLowerCase().includes(query));
+-    const visible = filtered.slice(0, MODEL_SEARCH_CAP);
++    // Only a search picker is capped: a list picker's rows are its whole offer (a gateway's runs
++    // past the cap), and one cut off there would hide models no scroll can reach.
++    const visible = searchable ? filtered.slice(0, MODEL_SEARCH_CAP) : filtered;
+     const loading = (searchable || dynamic) && (offeredLoading || !offeredLoaded);
+     const hasSearchField = searchable || all.length > 8;
+     return [
+@@ -775,7 +778,10 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+               type: "text",
+               placeholder: "Search models",
+               value: modelQuery,
+-              oncreate: (inputVnode: m.VnodeDOM) => (inputVnode.dom as HTMLInputElement).focus(),
++              // preventScroll: on a phone the submenu slides in on a horizontal track, and a plain focus
++              // scrolls that track to bring the field into view mid-slide, leaving the pane blank.
++              oncreate: (inputVnode: m.VnodeDOM) =>
++                (inputVnode.dom as HTMLInputElement).focus({ preventScroll: true }),
+               oninput: (event: Event) => {
+                 modelQuery = (event.target as HTMLInputElement).value;
+               },
+@@ -811,6 +817,11 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+                     },
+                   },
+                   [
++                    m(
++                      "span",
++                      { class: css.SUBMENU_ROW_MARK, "aria-hidden": "true" },
++                      m.trust(modelMark(option.id, 16)),
++                    ),
+                     // Front-truncated: an openrouter id is a path whose tail tells rows apart.
+                     startTruncated(option.label),
+                     isCurrent
+@@ -886,8 +897,12 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+       const readOnlyTooltip = interactive ? null : READ_ONLY_TOOLTIP;
+       const searchable = catalog?.picker_mode === "search";
+       const dynamic = catalog?.picker_mode === "dynamic";
++      // A list picker asks too: its harness may answer with a per-account set in place of the
++      // catalog (claude on a gateway account offers the gateway's models). Until that answer
++      // lands, and whenever it is null, the list is the catalog's.
++      const fetchesList = !readOnly && catalog?.picker_mode === "list";
+       viewedChatId = chatId;
+-      viewedPickerIsFetched = searchable || dynamic;
++      viewedPickerIsFetched = searchable || dynamic || fetchesList;
+ 
+       // The account the chat is moving to, and the model it runs on there: while a switch is armed
+       // for the next send, or being carried out, the menu reads as the target, since that is what
+@@ -960,7 +975,9 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+         matched === null
+           ? { model_id: "", effort: currentEffort, fast: currentFast }
+           : { model_id: matched.id, effort: currentEffort, fast: currentFast };
+-      const sourceOptions: CatalogModelOption[] = dynamic ? (dynamicOptions ?? []) : (catalog?.options ?? []);
++      const sourceOptions: CatalogModelOption[] = dynamic
++        ? (dynamicOptions ?? [])
++        : (dynamicOptions ?? catalog?.options ?? []);
+ 
+       const rows: MenuRow[] = [];
+       if (armed !== null) {
+@@ -1027,7 +1044,7 @@ export function ModelProviderMenu(): m.Component<ModelProviderMenuAttrs> {
+                   truncateValue: "start",
+                   maxHeight: css.MODEL_SUBMENU_MAX_HEIGHT,
+                   onOpen: () => {
+-                    if (searchable || dynamic) warmOfferedModels(chatId);
++                    if (searchable || dynamic || fetchesList) warmOfferedModels(chatId);
+                   },
+                   content: () =>
+                     modelSubmenu(chatId, sourceOptions, matched, currentIdentity, optimistic, searchable, dynamic),
+diff --git a/system/apps/chat/frontend/src/views/modelProviderMenuStyles.ts b/system/apps/chat/frontend/src/views/modelProviderMenuStyles.ts
+index e620d3219..088239ec0 100644
+--- a/system/apps/chat/frontend/src/views/modelProviderMenuStyles.ts
++++ b/system/apps/chat/frontend/src/views/modelProviderMenuStyles.ts
+@@ -189,6 +189,8 @@ export const SUBMENU_ROW_SELECTED = `${SUBMENU_ROW_SHAPE} bg-fill-active text-pr
+ export const ACCOUNT_ROW = `${ACCOUNT_ROW_BASE} text-primary group-hover/conn:bg-fill-hover cursor-pointer`;
+ export const ACCOUNT_ROW_SELECTED = `${ACCOUNT_ROW_BASE} bg-fill-active text-primary cursor-pointer`;
+ export const SUBMENU_ROW_NAME = "truncate";
++/** A model row's vendor mark: a fixed square, so rows without one keep their labels aligned. */
++export const SUBMENU_ROW_MARK = "inline-flex h-4 w-4 shrink-0 items-center justify-center text-secondary";
+ export const SUBMENU_ROW_SUB = "type-helper text-faint";
+ /** The MODEL row's tick: the last thing in the row, pushed out by `ml-auto` and so landing on
+  *  the row's own `px-2` padding edge -- which is where the account rows' pinned tick sits too,
+diff --git a/system/apps/chat/frontend/src/views/providerMarks.test.ts b/system/apps/chat/frontend/src/views/providerMarks.test.ts
+new file mode 100644
+index 000000000..bfd71b3de
+--- /dev/null
++++ b/system/apps/chat/frontend/src/views/providerMarks.test.ts
+@@ -0,0 +1,27 @@
++import { describe, expect, it } from "vitest";
++
++import { modelMark, providerMark } from "./providerMarks";
++
++describe("modelMark", () => {
++  it("marks a model with its vendor's mark at the asked size", () => {
++    const mark = modelMark("claude-opus-4-7", 16);
++    expect(mark).toContain('width="16"');
++    expect(mark).not.toContain("{S}");
++    expect(mark).toBe(providerMark("anthropic", 16));
++  });
++
++  it("marks the static Claude aliases as Anthropic", () => {
++    expect(modelMark("opus[1m]", 16)).toBe(providerMark("anthropic", 16));
++    expect(modelMark("haiku", 16)).toBe(providerMark("anthropic", 16));
++  });
++
++  it("finds the vendor of a routed id by its last segment", () => {
++    expect(modelMark("moonshotai/kimi-k2-6", 16)).not.toBe("");
++    expect(modelMark("moonshotai/kimi-k2-6", 16)).toBe(modelMark("kimi-k2-6", 16));
++  });
++
++  it("gives an unknown vendor no mark rather than a wrong one", () => {
++    expect(modelMark("grok-4.7", 16)).toBe("");
++    expect(modelMark("muse-spark-1.3", 16)).toBe("");
++  });
++});
+diff --git a/system/apps/chat/frontend/src/views/providerMarks.ts b/system/apps/chat/frontend/src/views/providerMarks.ts
+index 994e79729..6891e6182 100644
+--- a/system/apps/chat/frontend/src/views/providerMarks.ts
++++ b/system/apps/chat/frontend/src/views/providerMarks.ts
+@@ -27,12 +27,40 @@ const API_KEY = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="none" s
+ // the row reserves.
+ const OPENROUTER = `<svg width="{S}" height="{S}" viewBox="0 1 63 45" aria-hidden="true"><path fill="#7624F4" fill-rule="evenodd" d="M21.5 3.2 L50 3.2 C57 3.2 62.4 8.6 62.4 15.5 L62.4 18.5 L48.3 28.1 L62.4 40.5 C62.9 42.9 60.7 44.6 57 44.6 L21.5 44.6 A20.7 20.7 0 0 1 21.5 3.2 Z M12.7 23.7 a11.6 11.6 0 1 0 23.2 0 a11.6 11.6 0 1 0 -23.2 0 Z"/></svg>`;
+ 
++// Concentrate AI's dot-grid mark, from its own favicon. Every dot is grown a little, the
++// faintest most, because at row size the favicon's smallest dots fall below a pixel and the
++// mark reads as a smudge. currentColor rather than its near-black keeps it on the dark theme.
++const CONCENTRATE = `<svg width="{S}" height="{S}" viewBox="1 1 78 78" fill="currentColor" aria-hidden="true"><circle cx="6.4" cy="6.4" r="1.29"/><circle cx="16" cy="6.4" r="2.14"/><circle cx="25.6" cy="6.4" r="2.73"/><circle cx="35.2" cy="6.4" r="3.21"/><circle cx="44.8" cy="6.4" r="3.62"/><circle cx="54.4" cy="6.4" r="4"/><circle cx="64" cy="6.4" r="4.35"/><circle cx="73.6" cy="6.4" r="4.67"/><circle cx="6.4" cy="16" r="1.29"/><circle cx="16" cy="16" r="2.04"/><circle cx="25.6" cy="16" r="2.58"/><circle cx="35.2" cy="16" r="3.01"/><circle cx="44.8" cy="16" r="3.39"/><circle cx="54.4" cy="16" r="3.74"/><circle cx="64" cy="16" r="4.05"/><circle cx="73.6" cy="16" r="4.35"/><circle cx="6.4" cy="25.6" r="1.29"/><circle cx="16" cy="25.6" r="1.93"/><circle cx="25.6" cy="25.6" r="2.42"/><circle cx="35.2" cy="25.6" r="2.8"/><circle cx="44.8" cy="25.6" r="3.14"/><circle cx="54.4" cy="25.6" r="3.45"/><circle cx="64" cy="25.6" r="3.74"/><circle cx="73.6" cy="25.6" r="4"/><circle cx="6.4" cy="35.2" r="1.29"/><circle cx="16" cy="35.2" r="1.82"/><circle cx="25.6" cy="35.2" r="2.24"/><circle cx="35.2" cy="35.2" r="2.58"/><circle cx="44.8" cy="35.2" r="2.88"/><circle cx="54.4" cy="35.2" r="3.14"/><circle cx="64" cy="35.2" r="3.39"/><circle cx="73.6" cy="35.2" r="3.62"/><circle cx="6.4" cy="44.8" r="1.29"/><circle cx="16" cy="44.8" r="1.69"/><circle cx="25.6" cy="44.8" r="2.04"/><circle cx="35.2" cy="44.8" r="2.33"/><circle cx="44.8" cy="44.8" r="2.58"/><circle cx="54.4" cy="44.8" r="2.8"/><circle cx="64" cy="44.8" r="3.01"/><circle cx="73.6" cy="44.8" r="3.21"/><circle cx="6.4" cy="54.4" r="1.29"/><circle cx="16" cy="54.4" r="1.54"/><circle cx="25.6" cy="54.4" r="1.82"/><circle cx="35.2" cy="54.4" r="2.04"/><circle cx="44.8" cy="54.4" r="2.24"/><circle cx="54.4" cy="54.4" r="2.42"/><circle cx="64" cy="54.4" r="2.58"/><circle cx="73.6" cy="54.4" r="2.73"/><circle cx="6.4" cy="64" r="1.29"/><circle cx="16" cy="64" r="1.36"/><circle cx="25.6" cy="64" r="1.54"/><circle cx="35.2" cy="64" r="1.69"/><circle cx="44.8" cy="64" r="1.82"/><circle cx="54.4" cy="64" r="1.93"/><circle cx="64" cy="64" r="2.04"/><circle cx="73.6" cy="64" r="2.14"/><circle cx="6.4" cy="73.6" r="1.29"/><circle cx="16" cy="73.6" r="1.29"/><circle cx="25.6" cy="73.6" r="1.29"/><circle cx="35.2" cy="73.6" r="1.29"/><circle cx="44.8" cy="73.6" r="1.29"/><circle cx="54.4" cy="73.6" r="1.29"/><circle cx="64" cy="73.6" r="1.29"/><circle cx="73.6" cy="73.6" r="1.29"/></svg>`;
++
++// Model-vendor marks for the model list, from simple-icons (CC0). The model's own id names
++// its vendor: a gateway's list carries no vendor field the picker reads.
++const GEMINI = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/></svg>`;
++
++const DEEPSEEK = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45"/></svg>`;
++
++const QWEN = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M23.919 14.545 20.817 9.17l1.47-2.544a.56.56 0 0 0 0-.566l-1.633-2.83a.57.57 0 0 0-.49-.283h-6.207L12.487.402a.57.57 0 0 0-.49-.284H8.732a.56.56 0 0 0-.49.284L5.139 5.775h-2.94a.56.56 0 0 0-.49.284L.077 8.887a.56.56 0 0 0 0 .567L3.18 14.83l-1.47 2.545a.56.56 0 0 0 0 .566l1.634 2.83a.57.57 0 0 0 .49.283h6.205l1.47 2.545a.57.57 0 0 0 .49.284h3.266a.57.57 0 0 0 .49-.284l3.104-5.375h2.94a.57.57 0 0 0 .49-.283l1.634-2.828a.55.55 0 0 0-.004-.568M8.733.686l1.634 2.828-1.634 2.828H21.8L20.164 9.17H7.425L5.63 6.06Zm1.306 19.801-6.205-.002 1.634-2.83h3.265L2.201 6.344h3.267q3.182 5.517 6.367 11.032zm10.124-5.66L18.53 12l-6.532 11.315-1.634-2.83c2.129-3.673 4.25-7.351 6.373-11.028h3.592l3.102 5.374z"/></svg>`;
++
++const KIMI = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.765.351C22.998.351 24 1.353 24 2.586S22.998 4.82 21.765 4.82h-1.974c-.15 0-.26-.12-.26-.26V2.586A2.237 2.237 0 0 1 21.765.35M9.41 13.388l8.447-8.377c.16-.16.07-.471-.14-.471h-4.55s-.1.02-.14.06l-9.099 9.029c-.14.14-.35.02-.35-.21V4.81c0-.15-.1-.27-.221-.27H.22c-.12 0-.22.12-.22.27v18.57c0 .15.1.27.22.27h3.137c.12 0 .22-.12.22-.27v-3.79c0-.08.03-.16.08-.21l2.826-2.796c.07-.07.16-.08.241-.03l7.546 5.551a8.9 8.9 0 0 0 4.018 1.493c.12.01.23-.11.23-.27V19.76c0-.14-.08-.25-.19-.26a5.8 5.8 0 0 1-2.355-.942l-6.533-4.73c-.14-.09-.15-.32-.03-.441"/></svg>`;
++
++const MINIMAX = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.43 3.92a.86.86 0 1 0-1.718 0v14.236a1.999 1.999 0 0 1-3.997 0V9.022a.86.86 0 1 0-1.718 0v3.87a1.999 1.999 0 0 1-3.997 0V11.49a.57.57 0 0 1 1.139 0v1.404a.86.86 0 0 0 1.719 0V9.022a1.999 1.999 0 0 1 3.997 0v9.134a.86.86 0 0 0 1.719 0V3.92a1.998 1.998 0 1 1 3.996 0v11.788a.57.57 0 1 1-1.139 0zm10.572 3.105a2 2 0 0 0-1.999 1.997v7.63a.86.86 0 0 1-1.718 0V3.923a1.999 1.999 0 0 0-3.997 0v16.16a.86.86 0 0 1-1.719 0V18.08a.57.57 0 1 0-1.138 0v2a1.998 1.998 0 0 0 3.996 0V3.92a.86.86 0 0 1 1.719 0v12.73a1.999 1.999 0 0 0 3.996 0V9.023a.86.86 0 1 1 1.72 0v6.686a.57.57 0 0 0 1.138 0V9.022a2 2 0 0 0-1.998-1.997"/></svg>`;
++
++const XIAOMI = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C8.016 0 4.756.255 2.493 2.516.23 4.776 0 8.033 0 12.012c0 3.98.23 7.235 2.494 9.497C4.757 23.77 8.017 24 12 24c3.983 0 7.243-.23 9.506-2.491C23.77 19.247 24 15.99 24 12.012c0-3.984-.233-7.243-2.502-9.504C19.234.252 15.978 0 12 0zM4.906 7.405h5.624c1.47 0 3.007.068 3.764.827.746.746.827 2.233.83 3.676v4.54a.15.15 0 0 1-.152.147h-1.947a.15.15 0 0 1-.152-.148V11.83c-.002-.806-.048-1.634-.464-2.051-.358-.36-1.026-.441-1.72-.458H7.158a.15.15 0 0 0-.151.147v6.98a.15.15 0 0 1-.152.148H4.906a.15.15 0 0 1-.15-.148V7.554a.15.15 0 0 1 .15-.149zm12.131 0h1.949a.15.15 0 0 1 .15.15v8.892a.15.15 0 0 1-.15.148h-1.949a.15.15 0 0 1-.151-.148V7.554a.15.15 0 0 1 .151-.149zM8.92 10.948h2.046c.083 0 .15.066.15.147v5.352a.15.15 0 0 1-.15.148H8.92a.15.15 0 0 1-.152-.148v-5.352a.15.15 0 0 1 .152-.147Z"/></svg>`;
++
++const TENCENT = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0a1 1 0 0 1 0 24 1 1 0 0 1 0-24m1.65 1.12c.533.097 1.023.233 1.41.404 6.086 2.686 7.398 9.217 1.603 14.341a3.782 3.782 0 0 1-6.126-1.75 3.66 3.66 0 0 1-.095-1.622c-1.934.6-3.295 2.305-3.524 4.45-.204 1.912.324 4.044 2.056 5.634A11 11 0 1 0 13.65 1.12M2.748 6.21A11 11 0 0 0 8.9 22.55c-5.377-4.022-6.06-8.4-2.43-13.87a2.234 2.234 0 1 0-3.722-2.47m10.157-5.172c4.408 1.33 3.61 5.41 2.447 6.924-.86 1.117-2.922 1.46-3.708 2.238a4.18 4.18 0 0 0-1.212 2.292A5.3 5.3 0 0 1 12 12.258a5.672 5.672 0 0 0 1.404-11.169 11 11 0 0 0-.5-.052"/></svg>`;
++
++const META = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973a6.624 6.624 0 0 0 .265.86 5.297 5.297 0 0 0 .371.761c.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325c.061.1.121.196.183.3l2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843a3.743 3.743 0 0 0 .81-.973c.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.716-2.93-1.047 0-2.088.467-3.053 1.308-.652.57-1.257 1.29-1.82 2.05-.69-.875-1.335-1.547-1.958-2.056-1.182-.966-2.315-1.303-3.454-1.303zm10.16 2.053c1.147 0 2.188.758 2.992 1.999 1.132 1.748 1.647 4.195 1.647 6.4 0 1.548-.368 2.9-1.839 2.9-.58 0-1.027-.23-1.664-1.004-.496-.601-1.343-1.878-2.832-4.358l-.617-1.028a44.908 44.908 0 0 0-1.255-1.98c.07-.109.141-.224.211-.327 1.12-1.667 2.118-2.602 3.358-2.602zm-10.201.553c1.265 0 2.058.791 2.675 1.446.307.327.737.871 1.234 1.579l-1.02 1.566c-.757 1.163-1.882 3.017-2.837 4.338-1.191 1.649-1.81 1.817-2.486 1.817-.524 0-1.038-.237-1.383-.794-.263-.426-.464-1.13-.464-2.046 0-2.221.63-4.535 1.66-6.088.454-.687.964-1.226 1.533-1.533a2.264 2.264 0 0 1 1.088-.285z"/></svg>`;
++
++const MISTRAL = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M17.143 3.429v3.428h-3.429v3.429h-3.428V6.857H6.857V3.43H3.43v13.714H0v3.428h10.286v-3.428H6.857v-3.429h3.429v3.429h3.429v-3.429h3.428v3.429h-3.428v3.428H24v-3.428h-3.43V3.429z"/></svg>`;
++
++const NVIDIA = `<svg width="{S}" height="{S}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z"/></svg>`;
++
+ const MARKS_BY_LANE: Readonly<Record<string, string>> = {
+   anthropic: ANTHROPIC,
+   openai: OPENAI,
+   google: GOOGLE,
+   "opencode-go": OPENCODE,
+   openrouter: OPENROUTER,
++  concentrate: CONCENTRATE,
+   "api-key": API_KEY,
+ };
+ 
+@@ -41,3 +69,27 @@ export function providerMark(laneId: string, size: number): string {
+   const markup = MARKS_BY_LANE[laneId];
+   return markup === undefined ? "" : markup.split("{S}").join(String(size));
+ }
++
++const MODEL_MARK_RULES: ReadonlyArray<readonly [RegExp, string]> = [
++  [/^(claude-|fable|opus|sonnet|haiku)/, ANTHROPIC],
++  [/^(gpt-|o\d)/, OPENAI],
++  [/^gemini-/, GEMINI],
++  [/^gemma-/, GOOGLE],
++  [/^deepseek-/, DEEPSEEK],
++  [/^(qwen|qwq-)/, QWEN],
++  [/^kimi-/, KIMI],
++  [/^minimax-/, MINIMAX],
++  [/^mimo-/, XIAOMI],
++  [/^hy\d/, TENCENT],
++  [/^llama-/, META],
++  [/^(mistral-|magistral-|ministral-|codestral)/, MISTRAL],
++  [/^nemotron-/, NVIDIA],
++];
++
++/** The vendor mark for a model id, or "" when no known vendor makes it. A routed id
++ *  ("moonshotai/kimi-k2") is matched on its last segment. */
++export function modelMark(modelId: string, size: number): string {
++  const name = modelId.split("/").pop() ?? modelId;
++  const rule = MODEL_MARK_RULES.find(([pattern]) => pattern.test(name));
++  return rule === undefined ? "" : rule[1].split("{S}").join(String(size));
++}
+diff --git a/system/apps/chat/imbue/chat/accounts_endpoints_test.py b/system/apps/chat/imbue/chat/accounts_endpoints_test.py
+index 6db81001a..925b410e0 100644
+--- a/system/apps/chat/imbue/chat/accounts_endpoints_test.py
++++ b/system/apps/chat/imbue/chat/accounts_endpoints_test.py
+@@ -8,6 +8,7 @@ about the WIRE -- the key sets and the status codes -- which is the part nothing
+ 
+ from __future__ import annotations
+ 
++import json
+ from collections.abc import Iterator
+ from contextlib import contextmanager
+ from pathlib import Path
+@@ -20,6 +21,8 @@ from imbue.chat.accounts import mint_account_dir
+ from imbue.chat.accounts import read_index
+ from imbue.chat.agent_manager import AgentManager
+ from imbue.chat.harnesses.auth_flows import AuthFlowService
++from imbue.chat.harnesses.claude.gateway_models import GATEWAY_MODELS_FILE_NAME
++from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
+ from imbue.chat.harnesses.codex.model import codex_model_options_path
+ from imbue.chat.harnesses.codex.model import write_codex_model_options
+ from imbue.chat.harnesses.signed_in import SignedIn
+@@ -377,3 +380,28 @@ def test_account_model_options_offers_nothing_for_a_harness_whose_model_the_chat
+         answered = client.get(f"/api/accounts/{agy_id}/model-options")
+         assert answered.status_code == 200
+         assert answered.get_json() == {"models": None, "options": []}
++
++
++def test_account_model_options_offers_a_gateway_accounts_own_list(tmp_path: Path) -> None:
++    """A claude account pointed at a gateway (Concentrate) offers the gateway's models, from the list
++    kept beside the account while the gateway cannot be reached, and the catalog when none is kept."""
++    account_id, account_dir = mint_account_dir()
++    commit_account(account_id, "concentrate", "Concentrate AI")
++    # A port nothing listens on: the fetch is refused at once, so the kept list (or the catalog) answers.
++    (account_dir / "settings.json").write_text(
++        json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-cn-xyz", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9"}})
++    )
++    with _client_for(build_test_state()) as client:
++        unknown = client.get(f"/api/accounts/{account_id}/model-options")
++        assert unknown.status_code == 200
++        assert [option["id"] for option in unknown.get_json()["options"]] == [
++            option.id for option in CLAUDE_CATALOG.options
++        ]
++
++        (account_dir / GATEWAY_MODELS_FILE_NAME).write_text(
++            json.dumps({"data": [{"id": "kimi-k2-6", "display_name": "Kimi K2.6"}, {"id": "claude-opus-5-5"}]})
++        )
++        kept = client.get(f"/api/accounts/{account_id}/model-options")
++        offered = [(option["id"], option["label"]) for option in kept.get_json()["options"] if option["in_picker"]]
++        assert offered[-1] == ("kimi-k2-6", "Kimi K2.6")
++        assert "claude-opus-5-5" not in [option_id for option_id, _ in offered]
+diff --git a/system/apps/chat/imbue/chat/harnesses/auth_flows.py b/system/apps/chat/imbue/chat/harnesses/auth_flows.py
+index f1f15048f..452c33dca 100644
+--- a/system/apps/chat/imbue/chat/harnesses/auth_flows.py
++++ b/system/apps/chat/imbue/chat/harnesses/auth_flows.py
+@@ -43,6 +43,7 @@ from loguru import logger as _loguru_logger
+ 
+ from imbue.chat import accounts
+ from imbue.chat.harnesses.claude.auth import ANTHROPIC_API_KEY_ENV_VAR
++from imbue.chat.harnesses.claude.auth import ANTHROPIC_BASE_URL_ENV_VAR
+ from imbue.chat.harnesses.claude.auth import CLAUDE_CODE_OAUTH_TOKEN_ENV_VAR
+ from imbue.chat.harnesses.claude.auth import MANAGED_AUTH_ENV_KEYS
+ from imbue.chat.harnesses.claude.auth import parse_credential_lines
+@@ -468,7 +469,9 @@ class AuthFlowService:
+             # re-auth the folder is a LIVE account, and leaving a rejected key there would
+             # quietly break every agent bound to it until each one's next turn.
+             with _credentials_restored_on_error(_credential_paths(method.sink, path)) as before:
+-                display = _write_paste(method.sink, path, api_key, key_provider, session.lane)
++                display = _write_paste(
++                    method.sink, path, api_key, key_provider, session.lane, base_url=method.base_url
++                )
+                 # The parked copy exists to cover the window where the account has NO
+                 # credential on disk. That window closes the instant the new one lands, and
+                 # keeping the park past it is its own bug: dying between here and the commit
+@@ -930,7 +933,14 @@ def _credentials_restored_on_error(paths: Sequence[Path]) -> Iterator[Mapping[Pa
+         raise
+ 
+ 
+-def _write_paste(sink: PasteSink, account_path: Path, api_key: str, key_provider: str | None, lane: Lane) -> str:
++def _write_paste(
++    sink: PasteSink,
++    account_path: Path,
++    api_key: str,
++    key_provider: str | None,
++    lane: Lane,
++    base_url: str = "",
++) -> str:
+     """Write a pasted credential and return the provider noun the account is named after."""
+     match sink:
+         case PasteSink.PI_AUTH_JSON:
+@@ -952,7 +962,12 @@ def _write_paste(sink: PasteSink, account_path: Path, api_key: str, key_provider
+             path.chmod(0o600)
+             return lane.provider_name
+         case PasteSink.CLAUDE_ENV:
+-            write_claude_env(account_path, claude_env_from_paste(api_key))
++            managed_env = claude_env_from_paste(api_key)
++            # A gateway lane supplies its own address for a bare key. An env-block paste that
++            # names one already says where it goes, so it is left alone.
++            if base_url and ANTHROPIC_API_KEY_ENV_VAR in managed_env:
++                managed_env.setdefault(ANTHROPIC_BASE_URL_ENV_VAR, base_url)
++            write_claude_env(account_path, managed_env)
+             return lane.provider_name
+         case _ as unreachable:
+             assert_never(unreachable)
+diff --git a/system/apps/chat/imbue/chat/harnesses/auth_flows_test.py b/system/apps/chat/imbue/chat/harnesses/auth_flows_test.py
+index cc0d91bc9..dfec4d586 100644
+--- a/system/apps/chat/imbue/chat/harnesses/auth_flows_test.py
++++ b/system/apps/chat/imbue/chat/harnesses/auth_flows_test.py
+@@ -114,6 +114,25 @@ def test_a_claude_key_lands_in_the_account_settings_env(service: AuthFlowService
+     assert settings["env"]["ANTHROPIC_API_KEY"] == "sk-ant-xyz"
+ 
+ 
++def test_a_concentrate_key_is_written_with_concentrates_address(service: AuthFlowService, tmp_path: Path) -> None:
++    """The user pastes only a key; the lane supplies the gateway address claude needs to reach it."""
++    started = service.start("concentrate", "api_key")
++    service.submit_key(started.flow_id, "sk-cn-xyz", None)
++    (account,) = read_index(tmp_path).accounts
++    assert account.display == "Concentrate AI"
++    assert harness_for(account) is HarnessType.CLAUDE
++    settings = json.loads((tmp_path / ".minds" / "accounts" / account.id / "settings.json").read_text())
++    assert settings["env"] == {"ANTHROPIC_API_KEY": "sk-cn-xyz", "ANTHROPIC_BASE_URL": "https://api.concentrate.ai"}
++
++
++def test_a_plain_anthropic_key_gets_no_gateway_address(service: AuthFlowService, tmp_path: Path) -> None:
++    started = service.start("anthropic", "api_key")
++    service.submit_key(started.flow_id, "sk-ant-xyz", None)
++    (account,) = read_index(tmp_path).accounts
++    settings = json.loads((tmp_path / ".minds" / "accounts" / account.id / "settings.json").read_text())
++    assert "ANTHROPIC_BASE_URL" not in settings["env"]
++
++
+ def test_a_codex_key_lands_in_the_account_auth_json(service: AuthFlowService, tmp_path: Path) -> None:
+     """The file codex reads its credential from, written directly in its API-key shape rather than
+     the token shape a device login leaves there -- which is what makes an OpenAI account mintable
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/gateway_models.py b/system/apps/chat/imbue/chat/harnesses/claude/gateway_models.py
+new file mode 100644
+index 000000000..65774557d
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/claude/gateway_models.py
+@@ -0,0 +1,174 @@
++"""The model list of a gateway an account points claude at, for the model picker.
++
++An account whose settings.json sets ``ANTHROPIC_BASE_URL`` sends every claude request to that
++address instead of Anthropic. A gateway like Concentrate AI serves many more models there than
++the four the static catalog offers, and claude takes any of them by id (``/model kimi-k2-6``),
++so the picker should offer what the gateway actually has rather than the catalog's Claude-only
++set.
++
++The list is fetched from the gateway's own ``GET /v1/models`` with the account's key and the
++raw response is kept beside the account's settings, so the picker still has an answer while the
++gateway is unreachable, and so the chip can name a model after a restart before anyone opens the
++picker again. A gateway that does not serve a model list, or answers with something this does not
++understand, offers nothing extra: the static catalog stays the offer.
++"""
++
++import json
++import urllib.error
++import urllib.request
++from collections.abc import Callable
++from collections.abc import Mapping
++from pathlib import Path
++from typing import Any
++from typing import Final
++
++from loguru import logger
++
++from imbue.chat.errors import ChatAppError
++from imbue.chat.harnesses.claude.auth import ANTHROPIC_API_KEY_ENV_VAR
++from imbue.chat.harnesses.claude.auth import ANTHROPIC_BASE_URL_ENV_VAR
++from imbue.chat.harnesses.model import EffortChoice
++from imbue.chat.harnesses.model import ModelIdentity
++from imbue.chat.harnesses.model import ModelOption
++from imbue.chat.harnesses.model import match_option
++from imbue.imbue_common.frozen_model import FrozenModel
++
++# The raw `/v1/models` answer, kept in the account folder it was fetched for.
++GATEWAY_MODELS_FILE_NAME: Final = "gateway_models.json"
++
++_FETCH_TIMEOUT_SECONDS: Final = 10.0
++
++
++class GatewayModelListError(ChatAppError, ValueError):
++    """The gateway answered its model list with something that is not one."""
++
++
++class Gateway(FrozenModel):
++    """Where an account's claude requests go, and the key they carry."""
++
++    base_url: str
++    api_key: str
++
++
++def read_gateway(account_dir: Path) -> Gateway | None:
++    """The gateway the account at ``account_dir`` points claude at, or None for Anthropic itself."""
++    settings_path = account_dir / "settings.json"
++    try:
++        settings = json.loads(settings_path.read_text())
++    except (OSError, ValueError):
++        return None
++    env = settings.get("env") if isinstance(settings, dict) else None
++    if not isinstance(env, dict):
++        return None
++    base_url = env.get(ANTHROPIC_BASE_URL_ENV_VAR)
++    api_key = env.get(ANTHROPIC_API_KEY_ENV_VAR)
++    if not isinstance(base_url, str) or not base_url or not isinstance(api_key, str) or not api_key:
++        return None
++    return Gateway(base_url=base_url.rstrip("/"), api_key=api_key)
++
++
++def fetch_gateway_models_raw(gateway: Gateway) -> dict[str, Any]:
++    """The gateway's raw ``GET /v1/models`` answer. Raises ``OSError``/``ValueError`` on any failure."""
++    request = urllib.request.Request(
++        f"{gateway.base_url}/v1/models",
++        headers={"x-api-key": gateway.api_key, "anthropic-version": "2023-06-01"},
++    )
++    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_SECONDS) as response:
++        parsed = json.loads(response.read())
++    if not isinstance(parsed, dict):
++        raise GatewayModelListError("model list is not a JSON object")
++    return parsed
++
++
++def _is_offered_on_claude_code(raw_model: Mapping[str, Any]) -> bool:
++    """False only when the gateway says outright the model does not work with Claude Code.
++
++    Concentrate tags each model with its Claude Code compatibility; a model it marks unsupported
++    would give the user a chat that fails on its first turn. A gateway that tags nothing (or a
++    model it has not tagged) is taken at its word that the model exists.
++    """
++    integrations = raw_model.get("integrations")
++    if not isinstance(integrations, dict) or "claude_code" not in integrations:
++        return True
++    claude_code = integrations.get("claude_code")
++    return not (isinstance(claude_code, dict) and claude_code.get("supported") is False)
++
++
++def gateway_options(
++    raw: Mapping[str, Any], catalog_options: tuple[ModelOption, ...], efforts: tuple[EffortChoice, ...]
++) -> tuple[ModelOption, ...]:
++    """The picker options a gateway's raw model list means: the whole catalog, then the gateway's own.
++
++    The catalog's Claude models keep their place and their ``[1m]`` aliases, because the gateway
++    serves Claude too and those aliases are what keep the 1M window. Its hidden models come along
++    too (the picker does not show them), so a chip on one still names it. Every other model the
++    gateway lists is offered by its own id, with ``efforts`` (claude's own set, since claude keeps
++    and reports its effort setting whatever the model -- an option without one would never match
++    a live read) and without fast mode, which is an Opus capability. A gateway id the catalog
++    already matches (a Claude model, offered or hidden) is not offered twice.
++    """
++    data = raw.get("data")
++    if not isinstance(data, list):
++        return catalog_options
++    extra: list[ModelOption] = []
++    seen: set[str] = set()
++    for raw_model in data:
++        if not isinstance(raw_model, dict):
++            continue
++        model_id = raw_model.get("id") or raw_model.get("slug")
++        if not isinstance(model_id, str) or not model_id or model_id in seen:
++            continue
++        if not _is_offered_on_claude_code(raw_model):
++            continue
++        if match_option(ModelIdentity(model_id=model_id, effort=None, fast=False), catalog_options) is not None:
++            continue
++        seen.add(model_id)
++        label = raw_model.get("display_name") or raw_model.get("name") or model_id
++        extra.append(
++            ModelOption(
++                id=model_id,
++                label=str(label),
++                efforts=efforts,
++                supports_fast=False,
++                harness_reported_model_id=model_id,
++            )
++        )
++    return catalog_options + tuple(extra)
++
++
++def gateway_options_for_account(
++    account_dir: Path,
++    catalog_options: tuple[ModelOption, ...],
++    efforts: tuple[EffortChoice, ...],
++    fetch: Callable[[Gateway], dict[str, Any]] = fetch_gateway_models_raw,
++) -> tuple[ModelOption, ...] | None:
++    """The options an account's gateway offers: None for an account on Anthropic itself.
++
++    Fetched fresh and written through to the account folder; a failed fetch falls back to the
++    last list written there, and to the catalog when there is none, so the picker is never empty.
++    """
++    gateway = read_gateway(account_dir)
++    if gateway is None:
++        return None
++    cache_path = account_dir / GATEWAY_MODELS_FILE_NAME
++    try:
++        raw = fetch(gateway)
++    except (OSError, ValueError) as e:
++        logger.warning("Could not fetch the model list from {}: {}", gateway.base_url, e)
++        return cached_gateway_options(account_dir, catalog_options, efforts) or catalog_options
++    try:
++        cache_path.write_text(json.dumps(raw) + "\n")
++    except OSError as e:
++        logger.warning("Could not keep the model list at {}: {}", cache_path, e)
++    return gateway_options(raw, catalog_options, efforts)
++
++
++def cached_gateway_options(
++    account_dir: Path, catalog_options: tuple[ModelOption, ...], efforts: tuple[EffortChoice, ...]
++) -> tuple[ModelOption, ...]:
++    """The options from the last model list kept for this account, or empty when there is none."""
++    try:
++        raw = json.loads((account_dir / GATEWAY_MODELS_FILE_NAME).read_text())
++    except (OSError, ValueError):
++        return ()
++    return gateway_options(raw, catalog_options, efforts) if isinstance(raw, dict) else ()
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/gateway_models_test.py b/system/apps/chat/imbue/chat/harnesses/claude/gateway_models_test.py
+new file mode 100644
+index 000000000..349335768
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/claude/gateway_models_test.py
+@@ -0,0 +1,278 @@
++"""Unit tests for a gateway account's model list: reading the gateway, mapping its list, keeping it."""
++
++import json
++import threading
++from collections.abc import Iterator
++from http.server import BaseHTTPRequestHandler
++from http.server import ThreadingHTTPServer
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from imbue.chat.harnesses.claude.gateway_models import GATEWAY_MODELS_FILE_NAME
++from imbue.chat.harnesses.claude.gateway_models import Gateway
++from imbue.chat.harnesses.claude.gateway_models import cached_gateway_options
++from imbue.chat.harnesses.claude.gateway_models import fetch_gateway_models_raw
++from imbue.chat.harnesses.claude.gateway_models import gateway_options
++from imbue.chat.harnesses.claude.gateway_models import gateway_options_for_account
++from imbue.chat.harnesses.claude.gateway_models import read_gateway
++from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
++from imbue.chat.harnesses.claude.model import CLAUDE_EFFORTS
++from imbue.chat.harnesses.claude.model import ClaudeModelResolver
++from imbue.chat.harnesses.model import ModelIdentity
++from imbue.chat.harnesses.model import match_option
++
++# A trimmed copy of Concentrate's real `GET /v1/models` answer (pricing, capabilities and
++# descriptions dropped): Claude models the catalog offers and hides, one it does not know, a
++# model Concentrate marks unsupported on Claude Code, one it has not tagged, and two others.
++_CONCENTRATE_MODELS = Path(__file__).parent / "testdata" / "concentrate_models.json"
++
++_CATALOG = CLAUDE_CATALOG.options
++
++
++def _concentrate_raw() -> dict[str, Any]:
++    return json.loads(_CONCENTRATE_MODELS.read_text())
++
++
++def _account(tmp_path: Path, env: dict[str, str]) -> Path:
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    (account_dir / "settings.json").write_text(json.dumps({"env": env}))
++    return account_dir
++
++
++def _gateway_account(tmp_path: Path) -> Path:
++    return _account(
++        tmp_path, {"ANTHROPIC_API_KEY": "sk-cn-xyz", "ANTHROPIC_BASE_URL": "https://api.concentrate.ai/"}
++    )
++
++
++def _ids(options: tuple[Any, ...]) -> list[str]:
++    return [option.id for option in options]
++
++
++def _offered_ids(options: tuple[Any, ...]) -> list[str]:
++    return [option.id for option in options if option.in_picker]
++
++
++def _refuse(gateway: Gateway) -> dict[str, Any]:
++    raise OSError("connection refused")
++
++
++# -- read_gateway --
++
++
++def test_a_gateway_account_names_its_address_and_key(tmp_path: Path) -> None:
++    assert read_gateway(_gateway_account(tmp_path)) == Gateway(
++        base_url="https://api.concentrate.ai", api_key="sk-cn-xyz"
++    )
++
++
++@pytest.mark.parametrize(
++    "settings",
++    [
++        {"env": {"ANTHROPIC_API_KEY": "sk-ant-xyz"}},
++        {"env": {"ANTHROPIC_BASE_URL": "https://api.concentrate.ai"}},
++        {"env": {"ANTHROPIC_API_KEY": "", "ANTHROPIC_BASE_URL": "https://api.concentrate.ai"}},
++        {"env": "not a mapping"},
++        {},
++        ["not", "an", "object"],
++    ],
++)
++def test_an_account_without_both_an_address_and_a_key_is_on_anthropic(tmp_path: Path, settings: Any) -> None:
++    (tmp_path / "settings.json").write_text(json.dumps(settings))
++    assert read_gateway(tmp_path) is None
++
++
++def test_an_account_with_no_or_unreadable_settings_is_on_anthropic(tmp_path: Path) -> None:
++    assert read_gateway(tmp_path) is None
++    (tmp_path / "settings.json").write_text("{not json")
++    assert read_gateway(tmp_path) is None
++
++
++# -- gateway_options --
++
++
++def test_concentrates_list_maps_to_the_catalog_then_the_models_claude_code_can_run() -> None:
++    options = gateway_options(_concentrate_raw(), _CATALOG, CLAUDE_EFFORTS)
++    # The catalog's own offer comes first and unchanged, [1m] aliases and all; Claude ids the
++    # catalog already matches (Opus 5.5, the hidden Sonnet 4.5) are not offered twice; the model
++    # marked unsupported on Claude Code is dropped, and the untagged one is taken at its word.
++    assert _offered_ids(options) == [
++        *_offered_ids(_CATALOG),
++        "claude-haiku-5-5",
++        "gpt-5",
++        "gemma-3-12b",
++        "kimi-k2-6",
++    ]
++    by_id = {option.id: option for option in options}
++    kimi = by_id["kimi-k2-6"]
++    assert kimi.label == "Kimi K2.6"
++    assert kimi.efforts == CLAUDE_EFFORTS
++    assert kimi.supports_fast is False
++    assert kimi.harness_reported_model_id == "kimi-k2-6"
++    assert "gpt-oss-120b" not in by_id
++
++
++def test_the_catalogs_hidden_models_still_name_a_live_read_on_a_gateway() -> None:
++    """A chip on a model the picker does not offer (one chosen from claude's own /model) still
++    resolves, as it does on an Anthropic account."""
++    options = gateway_options(_concentrate_raw(), _CATALOG, CLAUDE_EFFORTS)
++    assert _ids(options)[: len(_CATALOG)] == _ids(_CATALOG)
++    hidden = match_option(ModelIdentity(model_id="claude-sonnet-4-5", effort=None, fast=False), options)
++    assert hidden is not None and hidden.in_picker is False
++
++
++def test_a_non_claude_model_from_the_gateway_matches_its_own_live_read() -> None:
++    options = gateway_options(_concentrate_raw(), _CATALOG, CLAUDE_EFFORTS)
++    matched = match_option(ModelIdentity(model_id="kimi-k2-6", effort="high", fast=False), options)
++    assert matched is not None and matched.id == "kimi-k2-6"
++
++
++def test_a_model_listed_twice_is_offered_once_and_a_bare_id_names_itself() -> None:
++    raw = {"data": [{"id": "glm-5"}, {"slug": "glm-5", "name": "GLM 5"}, {"id": ""}, "not a model", {"name": "x"}]}
++    options = gateway_options(raw, _CATALOG, CLAUDE_EFFORTS)
++    extra = options[len(_CATALOG) :]
++    assert [(option.id, option.label) for option in extra] == [("glm-5", "glm-5")]
++
++
++def test_a_slug_and_name_stand_in_for_a_missing_id_and_display_name() -> None:
++    options = gateway_options({"data": [{"slug": "glm-5", "name": "GLM 5"}]}, _CATALOG, CLAUDE_EFFORTS)
++    assert [(option.id, option.label) for option in options[len(_CATALOG) :]] == [("glm-5", "GLM 5")]
++
++
++@pytest.mark.parametrize("raw", [{}, {"data": None}, {"data": {"id": "glm-5"}}, {"error": "not found"}])
++def test_an_answer_with_no_model_list_offers_the_catalog(raw: dict[str, Any]) -> None:
++    assert gateway_options(raw, _CATALOG, CLAUDE_EFFORTS) == _CATALOG
++
++
++def test_an_empty_model_list_offers_the_catalog() -> None:
++    assert gateway_options({"data": []}, _CATALOG, CLAUDE_EFFORTS) == _CATALOG
++
++
++# -- gateway_options_for_account --
++
++
++def test_an_account_on_anthropic_asks_no_gateway(tmp_path: Path) -> None:
++    account_dir = _account(tmp_path, {"ANTHROPIC_API_KEY": "sk-ant-xyz"})
++    asked: list[Gateway] = []
++    result = gateway_options_for_account(
++        account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=lambda gateway: asked.append(gateway) or {}
++    )
++    assert result is None
++    assert asked == []
++    assert not (account_dir / GATEWAY_MODELS_FILE_NAME).exists()
++
++
++def test_a_fetched_list_is_kept_raw_beside_the_account(tmp_path: Path) -> None:
++    account_dir = _gateway_account(tmp_path)
++    raw = _concentrate_raw()
++    asked: list[Gateway] = []
++    options = gateway_options_for_account(
++        account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=lambda gateway: asked.append(gateway) or raw
++    )
++    assert asked == [Gateway(base_url="https://api.concentrate.ai", api_key="sk-cn-xyz")]
++    assert options is not None and "kimi-k2-6" in _ids(options)
++    assert json.loads((account_dir / GATEWAY_MODELS_FILE_NAME).read_text()) == raw
++
++
++def test_a_failed_fetch_offers_the_list_kept_from_the_last_one(tmp_path: Path) -> None:
++    account_dir = _gateway_account(tmp_path)
++    raw = _concentrate_raw()
++    fresh = gateway_options_for_account(account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=lambda gateway: raw)
++    offline = gateway_options_for_account(account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=_refuse)
++    assert offline == fresh
++
++
++def test_a_failed_fetch_with_nothing_kept_offers_the_catalog_rather_than_nothing(tmp_path: Path) -> None:
++    """An empty answer would leave the picker with no models at all."""
++    account_dir = _gateway_account(tmp_path)
++    assert gateway_options_for_account(account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=_refuse) == _CATALOG
++
++    def unparseable(gateway: Gateway) -> dict[str, Any]:
++        raise ValueError("not JSON")
++
++    assert gateway_options_for_account(account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=unparseable) == _CATALOG
++
++
++def test_a_list_that_cannot_be_kept_is_still_offered(tmp_path: Path) -> None:
++    account_dir = _gateway_account(tmp_path)
++    (account_dir / GATEWAY_MODELS_FILE_NAME).mkdir()
++    options = gateway_options_for_account(account_dir, _CATALOG, CLAUDE_EFFORTS, fetch=lambda gateway: _concentrate_raw())
++    assert options is not None and "kimi-k2-6" in _ids(options)
++
++
++def test_the_resolver_asks_the_account_it_is_handed(tmp_path: Path) -> None:
++    """With no reachable gateway and nothing kept, the account-level ask still answers."""
++    account_dir = _account(tmp_path, {"ANTHROPIC_API_KEY": "sk-cn-xyz", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9"})
++    assert ClaudeModelResolver.list_account_options(account_dir) == _CATALOG
++    assert ClaudeModelResolver.list_account_options(tmp_path / "missing") is None
++
++
++# -- cached_gateway_options --
++
++
++def test_nothing_kept_is_no_options(tmp_path: Path) -> None:
++    assert cached_gateway_options(tmp_path, _CATALOG, CLAUDE_EFFORTS) == ()
++    (tmp_path / GATEWAY_MODELS_FILE_NAME).write_text("{truncated")
++    assert cached_gateway_options(tmp_path, _CATALOG, CLAUDE_EFFORTS) == ()
++    (tmp_path / GATEWAY_MODELS_FILE_NAME).write_text("[]")
++    assert cached_gateway_options(tmp_path, _CATALOG, CLAUDE_EFFORTS) == ()
++
++
++# -- fetch_gateway_models_raw, against a local stand-in for the gateway --
++
++
++class _ModelsHandler(BaseHTTPRequestHandler):
++    body: bytes = b"{}"
++    status: int = 200
++    seen: list[tuple[str, str | None, str | None]] = []
++
++    def do_GET(self) -> None:
++        type(self).seen.append((self.path, self.headers.get("x-api-key"), self.headers.get("anthropic-version")))
++        self.send_response(self.status)
++        self.send_header("Content-Type", "application/json")
++        self.end_headers()
++        self.wfile.write(self.body)
++
++    def log_message(self, format: str, *args: Any) -> None:
++        return
++
++
++@pytest.fixture
++def gateway_server() -> Iterator[tuple[str, type[_ModelsHandler]]]:
++    handler = type("Handler", (_ModelsHandler,), {"seen": []})
++    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{server.server_address[1]}", handler
++    finally:
++        server.shutdown()
++        server.server_close()
++
++
++def test_the_list_is_asked_for_with_the_accounts_key(gateway_server: tuple[str, type[_ModelsHandler]]) -> None:
++    base_url, handler = gateway_server
++    handler.body = _CONCENTRATE_MODELS.read_bytes()
++    raw = fetch_gateway_models_raw(Gateway(base_url=base_url, api_key="sk-cn-xyz"))
++    assert raw == _concentrate_raw()
++    assert handler.seen == [("/v1/models", "sk-cn-xyz", "2023-06-01")]
++
++
++def test_an_answer_that_is_not_an_object_is_a_failure(gateway_server: tuple[str, type[_ModelsHandler]]) -> None:
++    base_url, handler = gateway_server
++    handler.body = b"[]"
++    with pytest.raises(ValueError):
++        fetch_gateway_models_raw(Gateway(base_url=base_url, api_key="k"))
++    handler.body = b"<html>"
++    with pytest.raises(ValueError):
++        fetch_gateway_models_raw(Gateway(base_url=base_url, api_key="k"))
++
++
++def test_a_refused_key_is_a_failure(gateway_server: tuple[str, type[_ModelsHandler]]) -> None:
++    base_url, handler = gateway_server
++    handler.status = 401
++    with pytest.raises(OSError):
++        fetch_gateway_models_raw(Gateway(base_url=base_url, api_key="bad"))
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/model.py b/system/apps/chat/imbue/chat/harnesses/claude/model.py
+index 8cfc8beb1..ca0813d86 100644
+--- a/system/apps/chat/imbue/chat/harnesses/claude/model.py
++++ b/system/apps/chat/imbue/chat/harnesses/claude/model.py
+@@ -66,6 +66,7 @@ from typing import Any
+ from loguru import logger
+ 
+ from imbue.chat.agent_discovery import AgentInfo
++from imbue.chat.harnesses.claude.gateway_models import gateway_options_for_account
+ from imbue.chat.harnesses.model import EffortChoice
+ from imbue.chat.harnesses.model import HarnessCatalog
+ from imbue.chat.harnesses.model import HarnessModelResolver
+@@ -80,7 +81,7 @@ from imbue.mngr_claude.claude_config import get_agent_hook_settings_path
+ 
+ # Every Claude model offers the same efforts: low..max shown, ultra (ultracode)
+ # declared-but-hidden. Effort levels are plain strings, as the catalog carries them.
+-_CLAUDE_EFFORTS: tuple[EffortChoice, ...] = (
++CLAUDE_EFFORTS: tuple[EffortChoice, ...] = (
+     EffortChoice(level="low"),
+     EffortChoice(level="medium"),
+     EffortChoice(level="high"),
+@@ -98,28 +99,28 @@ _OFFERED_MODELS: tuple[ModelOption, ...] = (
+     ModelOption(
+         id="fable[1m]",
+         label="Fable 5.1",
+-        efforts=_CLAUDE_EFFORTS,
++        efforts=CLAUDE_EFFORTS,
+         supports_fast=False,
+         harness_reported_model_id="claude-fable-5-1",
+     ),
+     ModelOption(
+         id="opus[1m]",
+         label="Opus 5.5",
+-        efforts=_CLAUDE_EFFORTS,
++        efforts=CLAUDE_EFFORTS,
+         supports_fast=True,
+         harness_reported_model_id="claude-opus-5-5",
+     ),
+     ModelOption(
+         id="sonnet[1m]",
+         label="Sonnet 5",
+-        efforts=_CLAUDE_EFFORTS,
++        efforts=CLAUDE_EFFORTS,
+         supports_fast=False,
+         harness_reported_model_id="claude-sonnet-5",
+     ),
+     ModelOption(
+         id="haiku",
+         label="Haiku 4.5",
+-        efforts=_CLAUDE_EFFORTS,
++        efforts=CLAUDE_EFFORTS,
+         supports_fast=False,
+         harness_reported_model_id="claude-haiku-4-5",
+     ),
+@@ -158,7 +159,7 @@ _HIDDEN_MODELS: tuple[ModelOption, ...] = tuple(
+     ModelOption(
+         id=model_id,
+         label=label,
+-        efforts=_CLAUDE_EFFORTS,
++        efforts=CLAUDE_EFFORTS,
+         supports_fast=supports_fast,
+         in_picker=False,
+         harness_reported_model_id=model_id,
+@@ -285,6 +286,19 @@ class ClaudeModelResolver(HarnessModelResolver):
+         self._state_dir = agent_info.agent_state_dir
+         return self
+ 
++    def list_offered_options(self) -> tuple[ModelOption, ...] | None:
++        """The gateway's models for an account that points claude at one; None (the catalog) otherwise.
++
++        The agent's config dir IS its account folder, so the account's own settings say where
++        its requests go. See ``gateway_models`` for why the gateway's list replaces the catalog.
++        """
++        return gateway_options_for_account(self._config_dir, CLAUDE_CATALOG.options, CLAUDE_EFFORTS)
++
++    @classmethod
++    def list_account_options(cls, account_dir: Path) -> tuple[ModelOption, ...] | None:
++        """As :meth:`list_offered_options`, for an account no agent runs on yet."""
++        return gateway_options_for_account(account_dir, CLAUDE_CATALOG.options, CLAUDE_EFFORTS)
++
+     def switch(self, identity: ModelIdentity, axes: frozenset[ModelAxis], send: Callable[[str], bool]) -> SwitchResult:
+         # Model, effort, and fast are three distinct Claude Code commands. Send only
+         # the axes the click actually changed -- the frontend computes that against
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/model_test.py b/system/apps/chat/imbue/chat/harnesses/claude/model_test.py
+index 6f960d076..9d52c1801 100644
+--- a/system/apps/chat/imbue/chat/harnesses/claude/model_test.py
++++ b/system/apps/chat/imbue/chat/harnesses/claude/model_test.py
+@@ -7,7 +7,7 @@ from typing import Any
+ from imbue.chat.agent_discovery import AgentInfo
+ from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
+ from imbue.chat.harnesses.claude.model import ClaudeModelResolver
+-from imbue.chat.harnesses.claude.model import _CLAUDE_EFFORTS
++from imbue.chat.harnesses.claude.model import CLAUDE_EFFORTS
+ from imbue.chat.harnesses.claude.model import _get_agent_fast_mode_write_path
+ from imbue.chat.harnesses.model import ModelAxis
+ from imbue.chat.harnesses.model import ModelIdentity
+@@ -113,7 +113,7 @@ def test_every_option_declares_the_full_effort_set() -> None:
+     # Sonnet 4.5 rejects the axis), and match_option shrugs on a level the option does not
+     # declare -- so guessing narrow risks a shrug and buys nothing, since a hidden option's
+     # effort set is never shown in a picker. supports_fast deliberately goes the other way.
+-    declared = {choice.level for choice in _CLAUDE_EFFORTS}
++    declared = {choice.level for choice in CLAUDE_EFFORTS}
+     for option in CLAUDE_CATALOG.options:
+         assert {choice.level for choice in option.efforts} == declared
+ 
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/session.py b/system/apps/chat/imbue/chat/harnesses/claude/session.py
+new file mode 100644
+index 000000000..3d258e790
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/claude/session.py
+@@ -0,0 +1,52 @@
++"""Claude's harness session: the file-harness session, plus a gateway account's model set."""
++
++import threading
++
++from imbue.chat.agent_discovery import read_claude_config_dir_from_env_file
++from imbue.chat.harnesses.claude.gateway_models import cached_gateway_options
++from imbue.chat.harnesses.claude.model import CLAUDE_EFFORTS
++from imbue.chat.harnesses.model import ModelOption
++from imbue.chat.harnesses.sending_registry import SendingRegistry
++from imbue.chat.harnesses.session import FileHarnessSession
++from imbue.chat.harnesses.session import SessionDeps
++
++
++class ClaudeHarnessSession(FileHarnessSession):
++    """A claude agent on a gateway account matches and validates against the gateway's models.
++
++    Everything else is the file-harness session's. An agent on Anthropic itself keeps the static
++    catalog; one whose account points claude at a gateway (Concentrate AI) is offered the gateway's
++    list by the picker, so the chip has to match against that same list or a model picked from it
++    would read as unrecognized, and the switch would reject it as unknown.
++    """
++
++    _offered_options: tuple[ModelOption, ...] | None
++
++    @classmethod
++    def build(cls, deps: SessionDeps) -> "ClaudeHarnessSession":
++        # The base's fields, set here so the subclass is the static type too (as agy's session does).
++        self = cls.__new__(cls)
++        self._deps = deps
++        self._sending = SendingRegistry.build()
++        self._sending_lock = threading.Lock()
++        self._offered_options = None
++        return self
++
++    def switch_options(self) -> tuple[ModelOption, ...]:
++        """The last picker-open's set; before one, the list last kept for the account; else the catalog.
++
++        The kept list is what lets the chip name a non-Claude model after a restart, before anyone
++        has opened the picker again.
++        """
++        if self._offered_options:
++            return self._offered_options
++        catalog_options = self._deps.catalog_options()
++        account_dir = read_claude_config_dir_from_env_file(self._deps.state_dir)
++        kept = cached_gateway_options(account_dir, catalog_options, CLAUDE_EFFORTS)
++        if kept:
++            self._offered_options = kept
++            return kept
++        return catalog_options
++
++    def note_offered_options(self, options: tuple[ModelOption, ...]) -> None:
++        self._offered_options = options
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/session_test.py b/system/apps/chat/imbue/chat/harnesses/claude/session_test.py
+new file mode 100644
+index 000000000..a2bbf3b15
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/claude/session_test.py
+@@ -0,0 +1,99 @@
++"""Unit tests for claude's session: which model set its chip and switch check against."""
++
++import json
++from pathlib import Path
++from typing import Any
++
++from imbue.chat.harnesses.claude.gateway_models import GATEWAY_MODELS_FILE_NAME
++from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
++from imbue.chat.harnesses.claude.model import CLAUDE_EFFORTS
++from imbue.chat.harnesses.claude.session import ClaudeHarnessSession
++from imbue.chat.harnesses.harness_type import HarnessType
++from imbue.chat.harnesses.model import ModelOption
++from imbue.chat.harnesses.registry import get_harness_spec
++from imbue.chat.harnesses.session import SessionDeps
++
++_CONCENTRATE_MODELS = Path(__file__).parent / "testdata" / "concentrate_models.json"
++
++
++def _session(state_dir: Path, account_dir: Path) -> ClaudeHarnessSession:
++    """A session for an agent whose env pins its claude config dir (its account) to ``account_dir``."""
++    state_dir.mkdir(parents=True, exist_ok=True)
++    (state_dir / "env").write_text(f"CLAUDE_CONFIG_DIR={account_dir}\n")
++    unused: Any = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unused"))
++    return ClaudeHarnessSession.build(
++        SessionDeps(
++            harness=HarnessType.CLAUDE,
++            state_dir=state_dir,
++            model_state_path=state_dir / "model_state.json",
++            send_to_harness=unused,
++            notify_agents_changed=lambda: None,
++            is_harness_starting_up=lambda: False,
++            is_tracked=lambda: True,
++            on_queue_snapshot=lambda snapshot: None,
++            on_user_turn=lambda event: None,
++            recompute_activity=lambda: None,
++            clear_queue_state=lambda: None,
++            catalog_options=lambda: CLAUDE_CATALOG.options,
++            build_interrupter=unused,
++            build_shoulder_tap=lambda agent_info: None,
++        )
++    )
++
++
++def _ids(options: tuple[ModelOption, ...]) -> list[str]:
++    return [option.id for option in options]
++
++
++def test_claude_agents_get_the_claude_session() -> None:
++    assert get_harness_spec(HarnessType.CLAUDE).session_class is ClaudeHarnessSession
++
++
++def test_an_agent_on_anthropic_checks_against_the_catalog(tmp_path: Path) -> None:
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    session = _session(tmp_path / "agent", account_dir)
++    assert session.switch_options() == CLAUDE_CATALOG.options
++
++
++def test_after_a_restart_the_list_kept_for_the_account_names_a_gateway_model(tmp_path: Path) -> None:
++    """Before anyone has opened the picker again, the chip still knows a model only the gateway has."""
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    (account_dir / GATEWAY_MODELS_FILE_NAME).write_text(_CONCENTRATE_MODELS.read_text())
++    session = _session(tmp_path / "agent", account_dir)
++    options = session.switch_options()
++    assert "kimi-k2-6" in _ids(options)
++    assert _ids(options)[: len(CLAUDE_CATALOG.options)] == _ids(CLAUDE_CATALOG.options)
++
++
++def test_a_picker_open_replaces_the_set_the_session_checks_against(tmp_path: Path) -> None:
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    (account_dir / GATEWAY_MODELS_FILE_NAME).write_text(_CONCENTRATE_MODELS.read_text())
++    session = _session(tmp_path / "agent", account_dir)
++    assert "kimi-k2-6" in _ids(session.switch_options())
++    glm = ModelOption(id="glm-5", label="GLM 5", efforts=CLAUDE_EFFORTS, supports_fast=False)
++    offered = (*CLAUDE_CATALOG.options, glm)
++    session.note_offered_options(offered)
++    assert session.switch_options() == offered
++
++
++def test_the_kept_list_is_read_once_and_then_held(tmp_path: Path) -> None:
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    kept_path = account_dir / GATEWAY_MODELS_FILE_NAME
++    kept_path.write_text(_CONCENTRATE_MODELS.read_text())
++    session = _session(tmp_path / "agent", account_dir)
++    first = session.switch_options()
++    kept_path.write_text(json.dumps({"data": [{"id": "glm-5"}]}))
++    assert session.switch_options() == first
++
++
++def test_an_empty_offer_does_not_clear_to_nothing(tmp_path: Path) -> None:
++    """A note of nothing (no caller sends one, but the set must never go empty) reads as no note."""
++    account_dir = tmp_path / "account"
++    account_dir.mkdir()
++    session = _session(tmp_path / "agent", account_dir)
++    session.note_offered_options(())
++    assert session.switch_options() == CLAUDE_CATALOG.options
+diff --git a/system/apps/chat/imbue/chat/harnesses/claude/testdata/concentrate_models.json b/system/apps/chat/imbue/chat/harnesses/claude/testdata/concentrate_models.json
+new file mode 100644
+index 000000000..f6afc0de6
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/claude/testdata/concentrate_models.json
+@@ -0,0 +1,277 @@
++{
++ "object": "list",
++ "data": [
++  {
++   "slug": "claude-opus-5-5",
++   "aliases": [
++    "claude-opus5.5",
++    "opus-5.5",
++    "opus5.5",
++    "opus-5-5",
++    "claude-5-5-opus"
++   ],
++   "name": "Claude Opus 5.5",
++   "release_date": 1790035200000,
++   "author": {
++    "slug": "anthropic",
++    "display_name": "Anthropic"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    },
++    "cursor": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    }
++   },
++   "id": "claude-opus-5-5",
++   "object": "model",
++   "created": 1790035200,
++   "owned_by": "anthropic",
++   "type": "model",
++   "display_name": "Claude Opus 5.5",
++   "created_at": "2026-09-22T00:00:00.000Z",
++   "max_input_tokens": 1000000,
++   "max_tokens": 128000
++  },
++  {
++   "slug": "claude-haiku-5-5",
++   "aliases": [
++    "claude-haiku5.5",
++    "haiku-5.5",
++    "haiku5.5",
++    "haiku-5-5",
++    "claude-5-5-haiku"
++   ],
++   "name": "Claude Haiku 5.5",
++   "release_date": 1791331200000,
++   "author": {
++    "slug": "anthropic",
++    "display_name": "Anthropic"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    },
++    "cursor": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    },
++    "codex": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    }
++   },
++   "id": "claude-haiku-5-5",
++   "object": "model",
++   "created": 1791331200,
++   "owned_by": "anthropic",
++   "type": "model",
++   "display_name": "Claude Haiku 5.5",
++   "created_at": "2026-10-07T00:00:00.000Z",
++   "max_input_tokens": 1000000,
++   "max_tokens": 128000
++  },
++  {
++   "slug": "claude-sonnet-4-5",
++   "aliases": [
++    "claude-sonnet-4.5",
++    "sonnet-4.5",
++    "sonnet-4-5",
++    "claude-4.5-sonnet",
++    "claude-sonnet-4-5-20250929"
++   ],
++   "name": "Claude Sonnet 4.5",
++   "release_date": 1759104000000,
++   "author": {
++    "slug": "anthropic",
++    "display_name": "Anthropic"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    },
++    "cursor": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    },
++    "codex": {
++     "supported": true,
++     "details": {
++      "compatibility": "high"
++     }
++    }
++   },
++   "id": "claude-sonnet-4-5",
++   "object": "model",
++   "created": 1759104000,
++   "owned_by": "anthropic",
++   "type": "model",
++   "display_name": "Claude Sonnet 4.5",
++   "created_at": "2025-09-29T00:00:00.000Z",
++   "max_input_tokens": 200000,
++   "max_tokens": 64000
++  },
++  {
++   "slug": "gpt-5",
++   "aliases": [
++    "gpt5",
++    "chatgpt-5",
++    "chatgpt5"
++   ],
++   "name": "GPT 5",
++   "release_date": 1754524800000,
++   "author": {
++    "slug": "openai",
++    "display_name": "OpenAI"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": true,
++     "details": {
++      "compatibility": "low"
++     }
++    },
++    "cursor": {
++     "supported": true,
++     "details": {
++      "compatibility": "medium"
++     }
++    },
++    "codex": {
++     "supported": true,
++     "details": {
++      "compatibility": "medium"
++     }
++    }
++   },
++   "id": "gpt-5",
++   "object": "model",
++   "created": 1754524800,
++   "owned_by": "openai",
++   "type": "model",
++   "display_name": "GPT 5",
++   "created_at": "2025-08-07T00:00:00.000Z",
++   "max_input_tokens": 400000,
++   "max_tokens": 128000
++  },
++  {
++   "slug": "gpt-oss-120b",
++   "aliases": [
++    "gpt-oss",
++    "openai-gpt-oss-120b"
++   ],
++   "name": "OpenAI gpt-oss 120B",
++   "release_date": 1754352000000,
++   "author": {
++    "slug": "openai",
++    "display_name": "OpenAI"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": false,
++     "details": {
++      "compatibility": "low"
++     }
++    },
++    "cursor": {
++     "supported": false,
++     "details": {
++      "compatibility": "low"
++     }
++    },
++    "codex": {
++     "supported": true,
++     "details": {
++      "compatibility": "low"
++     }
++    }
++   },
++   "id": "gpt-oss-120b",
++   "object": "model",
++   "created": 1754352000,
++   "owned_by": "openai",
++   "type": "model",
++   "display_name": "OpenAI gpt-oss 120B",
++   "created_at": "2025-08-05T00:00:00.000Z",
++   "max_input_tokens": 131072,
++   "max_tokens": 65536
++  },
++  {
++   "slug": "gemma-3-12b",
++   "aliases": [
++    "gemma-3-12b-it",
++    "google-gemma-3-12b"
++   ],
++   "name": "Gemma 3 12B",
++   "release_date": 1741737600000,
++   "author": {
++    "slug": "google",
++    "display_name": "Google"
++   },
++   "integrations": {},
++   "id": "gemma-3-12b",
++   "object": "model",
++   "created": 1741737600,
++   "owned_by": "google",
++   "type": "model",
++   "display_name": "Gemma 3 12B",
++   "created_at": "2025-03-12T00:00:00.000Z",
++   "max_input_tokens": 131072,
++   "max_tokens": 32768
++  },
++  {
++   "slug": "kimi-k2-6",
++   "aliases": [
++    "kimi-k2.6",
++    "k2.6",
++    "kimi-k26"
++   ],
++   "name": "Kimi K2.6",
++   "release_date": 1776643200000,
++   "author": {
++    "slug": "moonshot",
++    "display_name": "Moonshot AI"
++   },
++   "integrations": {
++    "claude_code": {
++     "supported": true,
++     "details": {
++      "compatibility": "high",
++      "notes": "Does not work for the azure-fw provider."
++     }
++    }
++   },
++   "id": "kimi-k2-6",
++   "object": "model",
++   "created": 1776643200,
++   "owned_by": "moonshot",
++   "type": "model",
++   "display_name": "Kimi K2.6",
++   "created_at": "2026-04-20T00:00:00.000Z",
++   "max_input_tokens": 262144,
++   "max_tokens": 131072
++  }
++ ],
++ "first_id": "claude-opus-5-5",
++ "last_id": "kimi-k2-6",
++ "has_more": false
++}
+diff --git a/system/apps/chat/imbue/chat/harnesses/lanes.py b/system/apps/chat/imbue/chat/harnesses/lanes.py
+index 3364dc8d7..3d957d1c6 100644
+--- a/system/apps/chat/imbue/chat/harnesses/lanes.py
++++ b/system/apps/chat/imbue/chat/harnesses/lanes.py
+@@ -163,6 +163,10 @@ class PasteMethod(FrozenModel):
+     # Where to go to get a key in the first place. A lane whose provider you have to subscribe
+     # to before a key exists needs this; one you already have an account with does not.
+     signup_url: str = ""
++    # A gateway that speaks Anthropic's API at its own address. Only meaningful on the
++    # CLAUDE_ENV sink: a bare key pasted here is written with this as ANTHROPIC_BASE_URL, so
++    # the user pastes one key and never has to know the address exists.
++    base_url: str = ""
+     # As on `PtyMethod`, and for the same reason: nothing else bounds a flow, and the service
+     # is single-flight, so an abandoned one is in the way of the next. Shorter than a browser
+     # method's, because there is no round trip to wait out -- the field is already on screen.
+@@ -504,6 +508,26 @@ LANE_OPENROUTER = Lane(
+     ),
+ )
+ 
++# A gateway in front of Anthropic and 200+ other models that speaks Anthropic's Messages API,
++# so claude runs on it unchanged once its address is set. Its own lane rather than a hidden
++# use of the anthropic one: the account is billed by Concentrate, and its row should say so.
++LANE_CONCENTRATE = Lane(
++    id="concentrate",
++    provider_name="Concentrate AI",
++    subtitle="200+ models from a single key.",
++    harness=HarnessType.CLAUDE,
++    methods=(
++        PasteMethod(
++            id="api_key",
++            label="Paste your Concentrate key",
++            description="Paste a raw sk-cn-... API key.",
++            sink=PasteSink.CLAUDE_ENV,
++            signup_url="https://concentrate.ai/dashboard",
++            base_url="https://api.concentrate.ai",
++        ),
++    ),
++)
++
+ LANE_API_KEY = Lane(
+     id="api-key",
+     provider_name="API key",
+@@ -528,6 +552,7 @@ LANES: Final[tuple[Lane, ...]] = (
+     LANE_GOOGLE,
+     LANE_OPENCODE_GO,
+     LANE_OPENROUTER,
++    LANE_CONCENTRATE,
+     LANE_API_KEY,
+ )
+ 
+diff --git a/system/apps/chat/imbue/chat/harnesses/lanes_test.py b/system/apps/chat/imbue/chat/harnesses/lanes_test.py
+index 4af844e40..214b82ec4 100644
+--- a/system/apps/chat/imbue/chat/harnesses/lanes_test.py
++++ b/system/apps/chat/imbue/chat/harnesses/lanes_test.py
+@@ -139,6 +139,19 @@ def test_only_the_key_lanes_offer_key_providers() -> None:
+     assert LANE_OPENAI.key_providers == ()
+ 
+ 
++def test_only_gateway_lanes_set_a_base_url_and_only_on_a_claude_paste() -> None:
++    """A base URL is written as ANTHROPIC_BASE_URL, which only the claude sink understands."""
++    for lane in LANES:
++        for method in lane.methods:
++            if isinstance(method, PasteMethod) and method.base_url:
++                assert method.sink is PasteSink.CLAUDE_ENV, lane.id
++                assert method.base_url.startswith("https://"), lane.id
++    concentrate = get_method("concentrate", "api_key")
++    anthropic = get_method("anthropic", "api_key")
++    assert isinstance(concentrate, PasteMethod) and concentrate.base_url == "https://api.concentrate.ai"
++    assert isinstance(anthropic, PasteMethod) and anthropic.base_url == ""
++
++
+ def test_key_provider_ids_are_unique_within_a_lane() -> None:
+     for lane in LANES:
+         ids = [k.provider_id for k in lane.key_providers]
+diff --git a/system/apps/chat/imbue/chat/harnesses/model.py b/system/apps/chat/imbue/chat/harnesses/model.py
+index fa45ee13d..4712646c2 100644
+--- a/system/apps/chat/imbue/chat/harnesses/model.py
++++ b/system/apps/chat/imbue/chat/harnesses/model.py
+@@ -371,8 +371,8 @@ class HarnessModelResolver(ABC):
+         account exists -- a classmethod for the same reason: there is no agent to build from. The
+         default is None, the honest answer for a harness whose catalog is static and the same on
+         every account of it (claude, pi): the catalog is the offer, and the account changes nothing
+-        about it. A harness whose set is account-derived (codex) overrides this and asks the
+-        account.
++        about it. A harness whose set is account-derived (codex, or claude on a gateway account)
++        overrides this and asks the account.
+         """
+         return None
+ 
+@@ -382,7 +382,8 @@ class HarnessModelResolver(ABC):
+         A dynamic harness (codex) has no static catalog: its model set, each model's efforts, and
+         fast support are all account/daemon-derived, so ids alone (:meth:`list_offered_models`)
+         cannot carry the per-model effort/fast the picker needs. Such a harness overrides this to
+-        return the full :class:`ModelOption`s, fetched fresh per picker-open (D2). The default --
++        return the full :class:`ModelOption`s, fetched fresh per picker-open (D2); claude does the
++        same for an account that points it at a gateway. The default --
+         for a static, catalog-backed harness (claude, pi) -- returns None: the picker renders the
+         catalog options (narrowed by :meth:`list_offered_models`)."""
+         return None
+diff --git a/system/apps/chat/imbue/chat/harnesses/registry.py b/system/apps/chat/imbue/chat/harnesses/registry.py
+index b82edcbc8..5b09d4ec3 100644
+--- a/system/apps/chat/imbue/chat/harnesses/registry.py
++++ b/system/apps/chat/imbue/chat/harnesses/registry.py
+@@ -39,6 +39,7 @@ from imbue.chat.harnesses.claude.activity import ClaudeActivityTracker
+ from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
+ from imbue.chat.harnesses.claude.model import CLAUDE_STATE_RELATIVE_PATH
+ from imbue.chat.harnesses.claude.model import ClaudeModelResolver
++from imbue.chat.harnesses.claude.session import ClaudeHarnessSession
+ from imbue.chat.harnesses.claude.one_shot import ClaudeOneShotCompletion
+ from imbue.chat.harnesses.claude.tap import ClaudeAtomicShoulderTap
+ from imbue.chat.harnesses.claude.tap import ClaudeInterruptToComposer
+@@ -355,6 +356,7 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
+         binding_class=ClaudeAccountBinding,
+         one_shot_completion_class=ClaudeOneShotCompletion,
+         resolver_class=ClaudeModelResolver,
++        session_class=ClaudeHarnessSession,
+         catalog_factory=lambda: CLAUDE_CATALOG,
+         model_state_relative_path=CLAUDE_STATE_RELATIVE_PATH,
+         # Claude Code's transcript has no turn boundaries; activity is inferred from an
+diff --git a/system/apps/chat/imbue/chat/server.py b/system/apps/chat/imbue/chat/server.py
+index a9518cf2b..5e494c122 100644
+--- a/system/apps/chat/imbue/chat/server.py
++++ b/system/apps/chat/imbue/chat/server.py
+@@ -815,6 +815,7 @@ def _get_model_options_endpoint(chat_id: str) -> Response:
+     * a DYNAMIC harness (codex) has no static catalog, so it returns the FULL per-agent
+       :class:`ModelOption`s (``options``) -- id, label, per-model efforts, fast support -- fetched
+       fresh from ``model/list`` on this open (D2), so a subscription-tier change shows up live.
++      Claude answers the same way for an account on a gateway, with the gateway's model list.
+     * a static/catalog-backed harness (claude, pi) returns ``models`` -- the ids to offer, matched
+       back to the static catalog for labels/efforts (``null`` = offer the whole catalog). This
+       reflects an account-gated set (pi's authenticated models) on a fresh login without a refetch.
